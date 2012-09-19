@@ -35,6 +35,8 @@ use POSIX;
 use Fcntl qw(:DEFAULT :flock);
 use Data::Dumper;
 use Storable ();
+use File::Copy;
+use BSTeamForgeConfig
 
 use BSConfig;
 use BSRPC;
@@ -1665,6 +1667,13 @@ while(1) {
       $publish_retry{$event} = time() + 60;
     } else {
       BSNotify::notify('REPO_PUBLISH_STATE', { 'project' => $ev->{'project'}, 'repo' => $ev->{'repository'}, 'state' => 'published'} );
+      if ($BSTeamForgeConfig::teamforge_mirror_enabled) {
+         copy("$myeventdir/${event}::inprogress", "$eventdir/teamforge/$event");
+         if (sysopen(F, "$eventdir/teamforge/.ping", POSIX::O_WRONLY|POSIX::O_NONBLOCK)) {
+            syswrite(F, 'x');
+            close(F);
+         }
+      }
       unlink("$myeventdir/${event}::inprogress");
     }
     db_sync();
