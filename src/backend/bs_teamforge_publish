@@ -1,0 +1,468 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) Andrzej Lisowski, Ericsson AB
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 2 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file COPYING); if not, write to the
+# Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+#
+################################################################
+#
+# The CollabNet TeamForge mirror. Mirror OBS YUM repositories to CollabNet
+# TeamForge
+#
+
+BEGIN {
+  my ($wd) = $0 =~ m-(.*)/- ;
+  $wd ||= '.';
+  unshift @INC,  "$wd/build";
+  unshift @INC,  "$wd";
+}
+
+use strict;
+use LWP;
+use XML::Simple;
+use Getopt::Long;
+use TeamForge6;
+use MIME::Base64 qw(encode_base64);
+use File::Type;
+use File::Basename;
+use File::Find;
+use POSIX;
+use Fcntl qw(:DEFAULT :flock);
+use Data::Dumper;
+use Scalar::Util;
+use URI;
+
+use BSXML;
+use BSConfig;
+use BSUtil;
+use BSTeamForgeConfig;
+
+my $user = $BSConfig::bsuser;
+my $group = $BSConfig::bsgroup;
+my $reporoot = "$BSConfig::bsdir/build";
+
+!defined($user) || defined($user = (getpwnam($user))[2]) || die("unknown user\n");
+!defined($group) || defined($group = (getgrnam($group))[2]) || die("unknown group\n");
+if (defined $group) {
+  ($), $() = ($group, $group);
+  die "setgid: $!\n" if ($) != $group);
+}
+if (defined $user) {
+  ($>, $<) = ($user, $user);
+  die "setuid: $!\n" if ($> != $user);
+}
+
+my $eventdir = "$BSConfig::bsdir/events";
+my $rundir = $BSConfig::rundir || "$BSConfig::bsdir/run";
+
+#TODO
+#1. I have implemented some fault handling for cases when Eforge is down.
+#   Think/test if there is any additional fault handling of eforge connection needed.
+
+my $obs_api_uri = $BSTeamForgeConfig::obs_api_uri;
+my $obs_api_user = $BSTeamForgeConfig::obs_api_user;
+my $obs_api_password = $BSTeamForgeConfig::obs_api_password;
+my $teamforge_user = $BSTeamForgeConfig::teamforge_user;
+my $teamforge_password = $BSTeamForgeConfig::teamforge_password;
+my $teamforge_url = $BSTeamForgeConfig::teamforge_url;
+my $debug = $BSTeamForgeConfig::debug;
+
+my $teamforge_session_id;
+my $teamforge_releases;
+my @search_results;
+
+#Dirty hack. Check for the validity of the SSL certificate for OBS server
+#has to be temporary disabled untill I manage to obtrain valid certificate
+#for my OBS instance
+$ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0;
+
+# for the convenience of &wanted calls, including -eval statements:
+use vars qw/*name *dir *prune/;
+*name   = *File::Find::name;
+*dir    = *File::Find::dir;
+*prune  = *File::Find::prune;
+
+sub wanted {
+    /^.*\..*rpm\z/s
+    && push(@search_results,$name);
+}
+
+#Check if the bs_teamforge_publish is logged into teamforge
+sub logged_to_teamforge {
+   my ($teamforge, $teamforge_session_id) = @_;
+
+   if ($teamforge_session_id && $teamforge) {
+      #If TeamForge is in state to return user data than I presume that the connection is OK
+      eval {
+         $teamforge->getUserData($teamforge_session_id);
+      };
+      if ($@) {
+         return 0;
+      }
+      else {
+         return 1;
+      }
+   }
+   else {
+      return 0;
+   }
+}
+
+#Login to teamforge
+sub login_to_teamforge {
+   my ($teamforge, $teamforge_user, $teamforge_password) = @_;
+   #check if all the input data is properly defined
+   my $teamforge_session_id;
+   do {
+      eval {
+         $teamforge_session_id  = $teamforge->login($teamforge_user,$teamforge_password);
+      };
+      if ($@) {
+         print scalar localtime . ": ERROR! $@";
+         #If TeamForge server can't be contacted than keep on looping
+         #it makes no sence to continue with execution if TeamForge is down
+         print scalar localtime . ": ERROR! Trying to (re)login to TeamForge in 60 seconds...\n";
+         sleep (60);
+      }
+      
+   } until ($teamforge_session_id);
+   return $teamforge_session_id;
+}
+
+#TODO Fault handling
+sub get_teamforge_package {
+   my ($browser, $ev) = @_;
+
+   if ($debug) {
+      print scalar localtime . ": URL to fetch TeamForgePackageId: $obs_api_uri/source/$ev->{'project'}/_attribute/OBS:TeamForgePackageId\n";
+   }
+
+   my $response = $browser->get("$obs_api_uri/source/$ev->{'project'}/_attribute/OBS:TeamForgePackageId");
+
+   do {
+      my $response = $browser->get("$obs_api_uri/source/$ev->{'project'}/_attribute/OBS:TeamForgePackageId");
+      if ($response->is_error()) {
+         print scalar localtime . ": ERROR! Could not contact API on OBS serverer: " .  $response->status_line . "\n";
+         print scalar localtime . ": ERROR! Trying to reconnect in 60 seconds...\n";
+         sleep (60);
+      }
+   } while ($response->is_error()); 
+
+   my $parsed_response = XMLin (($response->content()));
+
+   if ($debug) {
+      print scalar localtime . ": Parsed response from OBS: " . Dumper($parsed_response);
+   }
+
+   return $parsed_response->{attribute}->{value};
+}
+
+#TODO: This method can't handle unexpected crash of teamforge
+#      but I have to park it for now if I want to meet the deadline
+sub get_teamforge_release {
+   my ($teamforge, $teamforge_session_id, $teamforge_package_id, $ev) = @_;
+
+   my $frsa = $teamforge->FrsApp;
+   my $teamforge_release;
+
+   if ($debug) {
+      print scalar localtime . ": Requesting release list from TeamForge with following data:\n";
+      print scalar localtime . ": teamforge_session_id: $teamforge_session_id\n";
+      print scalar localtime . ": teamforge_package_id: $teamforge_package_id\n";
+   }
+
+   eval {
+      $teamforge_releases = $teamforge -> FrsApp -> getReleaseList($teamforge_session_id,$teamforge_package_id);
+   };
+   if ($@) {
+      print scalar localtime . ": ERROR! $@";
+      print scalar localtime . ": ERROR! Make sure that OBS:TeamForgePackageId is defined for $ev->{'project'} and points out correct TeamForge package Id.\n";
+      print scalar localtime . ": ERROR! Dropping the TeamForge publish request for the " . $ev->{'project'} . "\n";
+      return 0;
+   }
+
+   if ($debug) {
+      print scalar localtime . ": Number of releases: " . ($teamforge_releases->count + 1) . "\n";
+   }
+
+   #To upload packages I need to first find the proper release
+   #The releases are named after the distro or in the OBS lingo repository
+   my $number_of_releases = 0;
+
+   if ($debug) {
+      print scalar localtime . ": Number of teamforge releases before fetchrow: " . ($teamforge_releases->count + 1). "\n";
+   }
+
+   while (my $current_row = $teamforge_releases->fetchrow) {
+      #Beware that in OBS lingo 'repository' is actually name of the distribution
+      if (($current_row->title eq $ev->{'repository'}) && $number_of_releases == 0 ) {
+         $number_of_releases++;
+         #remove old files from the release
+         my $old_files = $frsa->getFrsFileList($teamforge_session_id,$current_row->id);
+         my $retry_counter = 0;
+         while (my $old_file = $old_files->fetchrow) {
+            eval {
+               $frsa->deleteFrsFile($teamforge_session_id,$old_file->id);
+            };
+            if ($@) {
+               print scalar localtime . ": ERROR! $@";
+               print scalar localtime . ": ERROR! Could not delete the file: $old_file->name\n";
+               print "                      located at:\n";
+               print "                      release id: $old_file->releaseId\n ";
+               print "                    release tile: $old_file->releaseTitle\n";
+               print "                      package id: $old_file->packageId\n";
+               print "                   package title: $old_file->packageTitle\n";
+               print "                      project id: $old_file->projectId\n";
+               print "                   project title: $old_file->projectTitle\n";
+            }
+         }
+         $teamforge_release = $current_row;
+      }
+      if (($current_row->title eq $ev->{'repository'}) && $number_of_releases > 1) {
+         $frsa->deleteRelease($teamforge_session_id,$current_row->id);
+      }
+   }
+   #If there is no release created yet for this distro than do it now
+   if ($number_of_releases==0) {
+      $teamforge_release = $frsa->createRelease($teamforge_session_id,
+                                                $teamforge_package_id,
+                                                $ev->{'repository'},
+                                                "This release contains packages uploaded from OBS. 
+                                                 It is fully managed by OBS so don't upload any 
+                                                 data here manually",
+                                                'active', #status
+                                                'Development Build'); #maturity
+
+   }
+   return $teamforge_release;
+}
+
+sub upload_packages_to_teamforge {
+   my ($teamforge_release, $teamforge, $teamforge_session_id, $ev) = @_;
+
+   my $sfsa = $teamforge->SimpleFileStorageApp;
+   my $frsa = $teamforge->FrsApp;
+
+   my @packages_to_upload = ();
+   @search_results = ();
+   #TODO: Add error handling for case when the directory does not exist.
+   File::Find::find({wanted => \&wanted}, "$reporoot/$ev->{'project'}/$ev->{'repository'}");
+
+   #If there are no packages to upload just drop the event
+   if ((scalar (@search_results)<0)) {
+      return 0;
+   }
+   my $package_to_upload;
+   my $ft = File::Type->new();
+   my $type;
+   my $buf;
+   my $teamforge_file_id;
+   my $found_package;
+   my $frs_file_list;
+   #We want to upload only packages from \:repo\
+   foreach $found_package (@search_results) {
+      if ($found_package =~ /\/\:repo\// ) {
+         push(@packages_to_upload, $found_package);
+      }
+   }  
+   foreach $package_to_upload (@packages_to_upload) {
+      eval {
+         $frs_file_list = $frsa->getFrsFileList($teamforge_session_id, $teamforge_release->id);
+      };
+      if ($@) {
+        print scalar localtime . ": ERROR! Can't get file list from the release\n";
+        print scalar localtime . ": ERROR! $@";
+        next;
+      }
+      my $file_already_uploaded = 0;
+      if ($debug) {
+          print scalar localtime . " Number of files exsting in the package: " . ($frs_file_list->count + 1). "\n";
+      }
+      my $data_row;
+      while ($data_row = $frs_file_list->fetchrow) {
+        if ($debug) {
+          print scalar localtime . " File uploaded: " . $data_row->filename . "\n";
+          print scalar localtime . " File to upload: " . basename ($package_to_upload) . "\n";
+        }
+        if ($data_row->filename eq basename ($package_to_upload)) {
+          $file_already_uploaded = 1;
+          if ($debug) {
+            print scalar localtime . " File already uploaded\n";
+          }
+        }
+      }
+      if ($file_already_uploaded) {
+        next;
+      }
+      eval {
+         $teamforge_file_id = $sfsa->startFileUpload($teamforge_session_id);
+      };
+      if ($@) {
+        print scalar localtime . ": ERROR! Can't upload file\n";
+        print scalar localtime . ": ERROR! $@";
+        next;
+      }
+      $type = $ft->checktype_filename($package_to_upload);
+      #TODO: Check if the file already exists on eforge before uploading it
+      #      It should not happen normally but I noticed that this script crashes terribly in such cases
+      open(FILE, $package_to_upload);
+      if (tell(FILE)!= -1) {
+         if ($debug) {
+            print scalar localtime . ": File handle for $package_to_upload is successfully opened\n";
+            print scalar localtime . ": Starting upload to eforge file $package_to_upload, it can take a while ...\n";
+         }
+      }
+      else {
+         if ($debug) {
+            print scalar localtime . ": File handle not opened successfully\n";
+         }
+         next;
+      }
+      #TODO: Possibly risky place, what if file is deleted by OBS while uploading to eforge?
+      #TODO: What happens when teamforge crashes during upload?
+      while(read(FILE, $buf, 60*57)) {
+          $sfsa->write($teamforge_session_id,$teamforge_file_id,encode_base64($buf));
+      }
+      close FILE;
+
+      ### Tell CTF the upload is done.
+      eval {
+         $sfsa->endFileUpload($teamforge_session_id,$teamforge_file_id);
+      };
+      if ($@) {
+         print scalar localtime . ": ERROR! $@";
+         print scalar localtime . ": ERROR! Problems with uploading the file $package_to_upload\n";
+      }
+
+      ### Now that the file is uploaded, add the file to the release.
+      my $ans = $frsa->createFrsFile($teamforge_session_id,$teamforge_release->id,basename($package_to_upload),$type,$teamforge_file_id);
+      if ($ans) {
+         if ($debug) {
+            print scalar localtime . ": Package $package_to_upload uploaded successfully\n";
+         }
+      }
+      else {
+         print scalar localtime . ": ERROR! Problems with uploading the file $package_to_upload\n";
+      }
+   }
+}
+
+$| = 1;
+$SIG{'PIPE'} = 'IGNORE';
+print scalar localtime . ": Starting build service teamforge publisher\n";
+
+open(RUNLOCK, '>>', "$rundir/bs_teamforge_publish.lock") || die("$rundir/bs_teamforge_publish.lock: $!\n");
+flock(RUNLOCK, LOCK_EX | LOCK_NB) || die("teamforge publisher is already running!\n");
+utime undef, undef, "$rundir/bs_teamforge_publish.lock";
+
+mkdir_p("$eventdir/teamforge");
+if (!-p "$eventdir/teamforge/.ping") {
+  POSIX::mkfifo("$eventdir/teamforge/.ping", 0666) || die("$eventdir/teamforge/.ping: $!");
+  chmod(0666, "$eventdir/teamforge/.ping");
+}
+sysopen(PING, "$eventdir/teamforge/.ping", POSIX::O_RDWR) || die("$eventdir/teamforge/.ping: $!");
+
+#Verify if the OBS API server can be contacted 
+my $browser = LWP::UserAgent->new;
+my $uri = URI->new($obs_api_uri);
+$browser->credentials(($uri->host . ":" . $uri->port), 'API login', $obs_api_user=>$obs_api_password);
+my $response = $browser->get("$obs_api_uri/about");
+if ($response->is_error()) {
+   print scalar localtime . ": ERROR! Could not contact API on OBS serverer: " . 
+   $response->status_line . "\n";
+   die;
+}
+
+#Initialize TeamForge
+my $teamforge      = TeamForge6->new( proxy => $teamforge_url);
+$teamforge->setError('raise');
+
+my $loop_counter = 0; #The variable for debug purpose only
+while(1) {
+
+   if ($debug) {
+      $loop_counter++;
+      print scalar localtime . ": loop_counter= $loop_counter\n";
+   } 
+
+   #First of all check if you are still connecter to TeamForge 
+   if (logged_to_teamforge($teamforge,$teamforge_session_id) == 0) {
+      #If you are not connected than connect 
+      $teamforge_session_id = login_to_teamforge ($teamforge, $teamforge_user, $teamforge_password); 
+   }
+
+   # drain ping pipe
+   my $dummy;
+   fcntl(PING,F_SETFL,POSIX::O_NONBLOCK);
+   1 while (sysread(PING, $dummy, 1024, 0) || 0) > 0;
+   fcntl(PING,F_SETFL,0);
+
+   # check for events
+   my @events = ls("$eventdir/teamforge/");
+   @events = grep {!/^\./} @events;
+
+   if ($debug) {
+      my $number_of_events = scalar (@events);
+      print scalar localtime . ": $number_of_events new event(s) found\n";
+   }
+
+   for my $event (@events) {
+      unless (-e "$eventdir/teamforge/$event") {
+         print scalar localtime . ": File Doesn't Exist!";
+      }
+      else {
+         print scalar localtime . ": File exists\n";
+      }
+      my $ev = readxml("$eventdir/teamforge/$event", $BSXML::event, 1);
+      if ($debug) {
+         print scalar localtime . ": Event type: " . $ev->{'type'} . "\n";
+         print scalar localtime . ": Project that generated event: " . $ev->{'project'} . "\n";
+      }
+      if (!$ev || !$ev->{'type'} || $ev->{'type'} ne 'publish') {
+         unlink("$eventdir/teamforge/$event");
+         next;
+      }
+      if (!defined($ev->{'project'}) || !defined($ev->{'repository'})) {
+         unlink("$eventdir/teamforge/$event");
+         next;
+      }
+
+      rename("$eventdir/teamforge/$event", "$eventdir/teamforge/${event}::inprogress");
+
+      my $teamforge_package_id = get_teamforge_package ($browser, $ev);
+
+      unless ($teamforge_package_id) {
+         print scalar localtime . ": ERROR! No or incorrect value has been assigned to OBS:TeamForgePackageId for OBS project " . $ev->{'project'} . "\n";
+         print scalar localtime . ": ERROR! Dropping the event for project " . $ev->{'project'} . "\n";
+         unlink("$eventdir/teamforge/${event}::inprogress");
+         next;
+      }
+
+      my $teamforge_release = get_teamforge_release ($teamforge, $teamforge_session_id, $teamforge_package_id, $ev);
+      
+      unless ($teamforge_release) {
+         print scalar localtime . ": ERROR! I had some unexpected troubles with obtaining teamforge release for uploading packages\n";
+         print scalar localtime . ": ERROR! Dropping the event for project " . $ev->{'project'} . "\n";
+         unlink("$eventdir/teamforge/${event}::inprogress");
+         next;
+      }
+
+      upload_packages_to_teamforge($teamforge_release, $teamforge, $teamforge_session_id, $ev);
+
+      unlink("$eventdir/teamforge/${event}::inprogress");
+   }
+   print scalar localtime . ": Waiting for an event...\n";
+   sysread(PING, $dummy, 1, 0);
+}
